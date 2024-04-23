@@ -1,12 +1,33 @@
-use std::{collections::BTreeMap, ffi::c_void, sync::Mutex};
-
+use bitflags::bitflags;
+use cocoa::{
+    appkit::NSEventType,
+    base::id,
+    foundation::{NSInteger, NSUInteger},
+};
 use keyboard_types::{Code, Modifiers};
+use objc::{class, msg_send, sel, sel_impl};
+use std::{
+    collections::{BTreeMap, HashSet},
+    ffi::c_void,
+    ptr,
+    sync::{Arc, Mutex},
+};
 
-use crate::{hotkey::HotKey, GlobalHotKeyEvent};
+use crate::{
+    hotkey::HotKey,
+    platform_impl::platform::ffi::{
+        kCFAllocatorDefault, kCFRunLoopCommonModes, CFMachPortCreateRunLoopSource,
+        CFRunLoopAddSource, CFRunLoopGetMain, CGEventMask, CGEventRef, CGEventTapCreate,
+        CGEventTapEnable, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+        CGEventTapProxy, CGEventType,
+    },
+    CGEventMaskBit, GlobalHotKeyEvent,
+};
 
 use self::ffi::{
     kEventClassKeyboard, kEventHotKeyPressed, kEventHotKeyReleased, kEventParamDirectObject, noErr,
-    typeEventHotKeyID, EventHandlerCallRef, EventHandlerRef, EventHotKeyID, EventHotKeyRef,
+    typeEventHotKeyID, CFMachPortInvalidate, CFMachPortRef, CFRelease, CFRunLoopRemoveSource,
+    CFRunLoopSourceRef, EventHandlerCallRef, EventHandlerRef, EventHotKeyID, EventHotKeyRef,
     EventRef, EventTypeSpec, GetApplicationEventTarget, GetEventKind, GetEventParameter,
     InstallEventHandler, OSStatus, RegisterEventHotKey, RemoveEventHandler, UnregisterEventHotKey,
 };
@@ -16,6 +37,9 @@ mod ffi;
 pub struct GlobalHotKeyManager {
     event_handler_ptr: EventHandlerRef,
     hotkeys: Mutex<BTreeMap<u32, HotKeyWrapper>>,
+    event_tap: Mutex<Option<CFMachPortRef>>,
+    event_tap_source: Mutex<Option<CFRunLoopSourceRef>>,
+    media_hotkeys: Arc<Mutex<HashSet<HotKey>>>,
 }
 
 unsafe impl Send for GlobalHotKeyManager {}
@@ -55,6 +79,9 @@ impl GlobalHotKeyManager {
         Ok(Self {
             event_handler_ptr: ptr,
             hotkeys: Mutex::new(BTreeMap::new()),
+            event_tap: Mutex::new(None),
+            event_tap_source: Mutex::new(None),
+            media_hotkeys: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -115,6 +142,14 @@ impl GlobalHotKeyManager {
                 .unwrap()
                 .insert(hotkey.id(), HotKeyWrapper { ptr, hotkey });
             Ok(())
+        } else if is_media_key(hotkey.key) {
+            {
+                let mut media_hotkeys = self.media_hotkeys.lock().unwrap();
+                if !media_hotkeys.insert(hotkey) {
+                    return Err(crate::Error::AlreadyRegistered(hotkey));
+                }
+            }
+            self.start_watching_media_keys()
         } else {
             Err(crate::Error::FailedToRegister(format!(
                 "Unable to register accelerator (unknown scancode for this key: {}).",
@@ -124,7 +159,13 @@ impl GlobalHotKeyManager {
     }
 
     pub fn unregister(&self, hotkey: HotKey) -> crate::Result<()> {
-        if let Some(hotkeywrapper) = self.hotkeys.lock().unwrap().remove(&hotkey.id()) {
+        if is_media_key(hotkey.key) {
+            let mut media_hotkey = self.media_hotkeys.lock().unwrap();
+            media_hotkey.remove(&hotkey);
+            if media_hotkey.is_empty() {
+                self.stop_watching_media_keys();
+            }
+        } else if let Some(hotkeywrapper) = self.hotkeys.lock().unwrap().remove(&hotkey.id()) {
             unsafe { self.unregister_hotkey_ptr(hotkeywrapper.ptr, hotkey) }?;
         }
 
@@ -156,6 +197,128 @@ impl GlobalHotKeyManager {
 
         Ok(())
     }
+
+    fn start_watching_media_keys(&self) -> crate::Result<()> {
+        let mut event_tap = self.event_tap.lock().unwrap();
+        let mut event_tap_source = self.event_tap_source.lock().unwrap();
+
+        if event_tap.is_some() || event_tap_source.is_some() {
+            return Ok(());
+        }
+
+        unsafe {
+            let event_mask: CGEventMask = CGEventMaskBit!(CGEventType::SystemDefined);
+            let tap = CGEventTapCreate(
+                CGEventTapLocation::Session,
+                CGEventTapPlacement::HeadInsertEventTap,
+                CGEventTapOptions::Default,
+                event_mask,
+                media_key_event_callback,
+                Arc::into_raw(self.media_hotkeys.clone()) as *const c_void,
+            );
+            if tap.is_null() {
+                return Err(crate::Error::FailedToWatchMediaKeyEvent);
+            }
+            *event_tap = Some(tap);
+
+            let loop_source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0);
+            if loop_source.is_null() {
+                // cleanup event_tap
+                CFMachPortInvalidate(tap);
+                CFRelease(tap as *const c_void);
+                *event_tap = None;
+
+                return Err(crate::Error::FailedToWatchMediaKeyEvent);
+            }
+            *event_tap_source = Some(loop_source);
+
+            let run_loop = CFRunLoopGetMain();
+            CFRunLoopAddSource(run_loop, loop_source, kCFRunLoopCommonModes);
+            CGEventTapEnable(tap, true);
+
+            Ok(())
+        }
+    }
+
+    fn stop_watching_media_keys(&self) {
+        unsafe {
+            if let Some(event_tap_source) = self.event_tap_source.lock().unwrap().take() {
+                let run_loop = CFRunLoopGetMain();
+                CFRunLoopRemoveSource(run_loop, event_tap_source, kCFRunLoopCommonModes);
+                CFRelease(event_tap_source as *const c_void);
+            }
+            if let Some(event_tap) = self.event_tap.lock().unwrap().take() {
+                CFMachPortInvalidate(event_tap);
+                CFRelease(event_tap as *const c_void);
+            }
+        }
+    }
+}
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct NSEventModifierFlags: NSUInteger {
+        const Shift = 1 << 17;
+        const Control = 1 << 18;
+        const Option = 1 << 19;
+        const Command = 1 << 20;
+    }
+}
+
+impl From<NSEventModifierFlags> for Modifiers {
+    fn from(mod_flags: NSEventModifierFlags) -> Self {
+        let mut mods = Modifiers::empty();
+        if mod_flags.contains(NSEventModifierFlags::Shift) {
+            mods |= Modifiers::SHIFT;
+        }
+        if mod_flags.contains(NSEventModifierFlags::Control) {
+            mods |= Modifiers::CONTROL;
+        }
+        if mod_flags.contains(NSEventModifierFlags::Option) {
+            mods |= Modifiers::ALT;
+        }
+        if mod_flags.contains(NSEventModifierFlags::Command) {
+            mods |= Modifiers::META;
+        }
+        mods
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[allow(non_camel_case_types)]
+enum NX_KEYTYPE {
+    Play = 16, // Actually it's Play/Pause
+    Next = 17,
+    Previous = 18,
+    Fast = 19,
+    Rewind = 20,
+}
+
+impl TryFrom<i64> for NX_KEYTYPE {
+    type Error = String;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        match value {
+            16 => Ok(NX_KEYTYPE::Play),
+            17 => Ok(NX_KEYTYPE::Next),
+            18 => Ok(NX_KEYTYPE::Previous),
+            19 => Ok(NX_KEYTYPE::Fast),
+            20 => Ok(NX_KEYTYPE::Rewind),
+            _ => Err(String::from("Not defined media key")),
+        }
+    }
+}
+
+impl From<NX_KEYTYPE> for Code {
+    fn from(nx_keytype: NX_KEYTYPE) -> Self {
+        match nx_keytype {
+            NX_KEYTYPE::Play => Code::MediaPlayPause,
+            NX_KEYTYPE::Next => Code::MediaTrackNext,
+            NX_KEYTYPE::Previous => Code::MediaTrackPrevious,
+            NX_KEYTYPE::Fast => Code::MediaFastForward,
+            NX_KEYTYPE::Rewind => Code::MediaRewind,
+        }
+    }
 }
 
 impl Drop for GlobalHotKeyManager {
@@ -167,6 +330,7 @@ impl Drop for GlobalHotKeyManager {
         unsafe {
             RemoveEventHandler(self.event_handler_ptr);
         }
+        self.stop_watching_media_keys()
     }
 }
 
@@ -207,12 +371,66 @@ unsafe extern "C" fn hotkey_handler(
     noErr as _
 }
 
+unsafe extern "C" fn media_key_event_callback(
+    _proxy: CGEventTapProxy,
+    ev_type: CGEventType,
+    event: CGEventRef,
+    user_info: *const c_void,
+) -> CGEventRef {
+    if ev_type != CGEventType::SystemDefined {
+        return event;
+    }
+
+    let ns_event: id = msg_send![class!(NSEvent), eventWithCGEvent:event];
+    let event_type: NSEventType = msg_send![ns_event, type];
+    let event_subtype: u64 = msg_send![ns_event, subtype];
+
+    if event_type == NSEventType::NSSystemDefined && event_subtype == 8 {
+        // Key
+        let data_1: NSInteger = msg_send![ns_event, data1];
+        let nx_keytype = NX_KEYTYPE::try_from((data_1 & 0xFFFF0000) >> 16);
+        if nx_keytype.is_err() {
+            return event;
+        }
+        let nx_keytype = nx_keytype.unwrap();
+
+        // Modifiers
+        let mods: NSUInteger = msg_send![ns_event, modifierFlags];
+        let mods = NSEventModifierFlags::from_bits_truncate(mods);
+
+        // Generate hotkey for matching
+        let hotkey = HotKey::new(Some(mods.into()), nx_keytype.into());
+
+        // Prevent Arc been releaded after callback returned
+        let media_hotkeys = &*(user_info as *const Mutex<HashSet<HotKey>>);
+
+        if let Some(media_hotkey) = media_hotkeys.lock().unwrap().get(&hotkey) {
+            let key_flags = data_1 & 0x0000FFFF;
+            let is_pressed: bool = ((key_flags & 0xFF00) >> 8) == 0xA;
+            GlobalHotKeyEvent::send(GlobalHotKeyEvent {
+                id: media_hotkey.id(),
+                state: match is_pressed {
+                    true => crate::HotKeyState::Pressed,
+                    false => crate::HotKeyState::Released,
+                },
+            });
+
+            // Hotkey was found, return null to stop propagate event
+            return ptr::null();
+        }
+    }
+
+    event
+}
+
 #[derive(Clone, Copy, Debug)]
 struct HotKeyWrapper {
     ptr: EventHotKeyRef,
     hotkey: HotKey,
 }
 
+// https://macbiblioblog.blogspot.com/2014/12/key-codes-for-function-and-special-keys.html
+// can also be found in /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX10.10.sdk/System/Library/Frameworks/Carbon.framework/Versions/A/Frameworks/HIToolbox.framework/Versions/A/Headers/Events.h
 pub fn key_to_scancode(code: Code) -> Option<u32> {
     match code {
         Code::KeyA => Some(0x00),
@@ -322,4 +540,15 @@ pub fn key_to_scancode(code: Code) -> Option<u32> {
         Code::PrintScreen => Some(0x46),
         _ => None,
     }
+}
+
+fn is_media_key(code: Code) -> bool {
+    matches!(
+        code,
+        Code::MediaPlayPause
+            | Code::MediaTrackNext
+            | Code::MediaTrackPrevious
+            | Code::MediaFastForward
+            | Code::MediaRewind
+    )
 }
