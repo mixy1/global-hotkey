@@ -229,7 +229,10 @@ fn parse_hotkey(hotkey: &str) -> Result<HotKey, HotKeyParseError> {
         }
     }
 
-    Ok(HotKey::new(Some(mods), key.unwrap()))
+    Ok(HotKey::new(
+        Some(mods),
+        key.ok_or_else(|| HotKeyParseError::InvalidFormat(hotkey.to_string()))?,
+    ))
 }
 
 fn parse_key(key: &str) -> Result<Code, HotKeyParseError> {
@@ -448,6 +451,12 @@ fn test_parse_hotkey() {
             id: 0,
         }
     );
+
+    // Ensure that if it is just multiple modifiers, we do not panic.
+    // This would be a regression if this happened.
+    if HotKey::from_str("Shift+Ctrl").is_ok() {
+        panic!("This is not a valid hotkey");
+    }
 }
 
 #[test]
