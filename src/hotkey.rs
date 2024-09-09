@@ -55,7 +55,7 @@ pub struct HotKey {
     /// The hotkey key.
     pub key: Code,
     /// The hotkey id.
-    pub id: u64,
+    pub id: u32,
 }
 
 #[cfg(feature = "serde")]
@@ -91,14 +91,12 @@ impl HotKey {
             mods.insert(Modifiers::SUPER);
         }
 
-        let mut hotkey = Self { mods, key, id: 0 };
-        hotkey.id = (mods.bits() as u64) << 32 | key as u64;
-        hotkey
+        Self { mods, key, id: (mods.bits() as u32) << 16 | key as u32}
     }
 
     /// Returns the id associated with this hotKey
     /// which is a hash of the string represention of modifiers and key within this hotKey.
-    pub fn id(&self) -> u64 {
+    pub fn id(&self) -> u32 {
         self.id
     }
 
