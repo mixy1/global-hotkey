@@ -91,7 +91,11 @@ impl HotKey {
             mods.insert(Modifiers::SUPER);
         }
 
-        Self { mods, key, id: (mods.bits() as u32) << 16 | key as u32}
+        Self {
+            mods,
+            key,
+            id: mods.bits() << 16 | key as u32,
+        }
     }
 
     /// Returns the id associated with this hotKey
